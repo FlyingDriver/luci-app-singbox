@@ -1,0 +1,16 @@
+# 构建产物
+.build/
+.build-apk/
+dist/
+*.ipk
+*.apk.tmp
+
+# 编辑器 / 系统
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/
+
+# 测试残留
+*.log

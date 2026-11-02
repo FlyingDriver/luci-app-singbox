@@ -1,0 +1,49 @@
+{
+ "luci-app-singbox": {
+  "description": "Grant access to sing-box management",
+  "read": {
+   "ubus": {
+    "service": [
+     "list"
+    ],
+    "luci.singbox": [
+     "status",
+     "clash_get",
+     "nodes_list",
+     "rules_list",
+     "logs_read",
+     "backup_list",
+     "run_stats",
+     "ip_check",
+     "access_check",
+     "ruleset_list",
+     "ruleset_read",
+     "tmp_stats"
+    ]
+   },
+   "file": {
+    "/etc/sing-box/config.json": [
+     "read"
+    ]
+   }
+  },
+  "write": {
+   "ubus": {
+    "luci.singbox": [
+     "set_mode",
+     "select_node",
+     "test_node",
+     "node_save",
+     "node_delete",
+     "rules_save",
+     "service",
+     "flush_dns",
+     "close_connections",
+     "ruleset_save",
+     "rules_merge",
+     "tmp_cleanup"
+    ]
+   }
+  }
+ }
+}

@@ -1,0 +1,1543 @@
+#!/usr/bin/ucode
+/*
+ * luci-app-singbox - sing-box 可视化管理插件后端
+ *
+ * 设计原则：
+ *   1. Clash API 仅监听 127.0.0.1，由本后端代理转发，凭据不出服务器
+ *   2. 所有配置写入前先备份 → sing-box check 校验 → 通过才落盘并重载
+ *   3. 不修改用户未授权的内容（只动 outbounds 节点与 route.rules 规则）
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
+'use strict';
+
+import { access, popen, readfile, writefile, stat, unlink, basename } from 'fs';
+
+const CONF        = '/etc/sing-box/config.json';
+const CONF_BAK    = '/etc/sing-box/config.json.bak-luci';
+const INIT        = '/etc/init.d/singbox';
+const RULES_DIR   = '/etc/sing-box/rules';
+const CLASH_HOST  = '127.0.0.1';
+const CLASH_PORT  = 9090;
+
+/* ───────────────────────── 工具函数 ───────────────────────── */
+
+function shellquote(s) {
+	return `'${replace(`${s}`, "'", "'\\''")}'`;
+}
+
+/*
+ * URL 百分号编码（RFC 3986 unreserved 之外全部编码）。
+ * 注意：ucode 没有浏览器环境的 encodeURIComponent，
+ * 而节点组名含中文/emoji（如「♻️ 自动选择」），必须自行编码。
+ */
+/*
+ * 校验规则集 tag 的合法性（防命令注入 + 路径遍历）
+ *
+ * 合法 tag 只能包含：字母、数字、下划线、短横线、点、感叹号、@
+ * 这些是 geosite-* / geoip-* / pi-b* / 语义化命名的实际字符集：
+ *   geosite-category-ai-!cn, geoip-cn, direct-extra, proxy, media ...
+ *
+ * 明确拒绝：/ \ ; & | $ ` > < ( ) { } [ ] * ? ~ # 空格 换行 等
+ *
+ * 注意：ucode 正则不支持 (?:...) 非捕获组，必须用普通分组。
+ */
+function safe_tag(tag) {
+	if (tag == null || type(tag) !== 'string')
+		return null;
+
+	const t = `${tag}`;
+
+	/* 长度限制：实际 tag 最长约 40（geosite-category-ai-!cn） */
+	if (length(t) == 0 || length(t) > 64)
+		return null;
+
+	/* 白名单：只允许 [A-Za-z0-9_.!@-] */
+	if (!match(t, /^[A-Za-z0-9_.!@-]+$/))
+		return null;
+
+	/* 额外拒绝 ".." 防止路径遍历（上面的白名单已排除 / 但仍显式拒绝） */
+	if (match(t, /\.\./))
+		return null;
+
+	/* 拒绝以 . 或 - 开头（避免隐藏文件、参数注入） */
+	if (match(t, /^[.-]/))
+		return null;
+
+	return t;
+}
+
+/*
+ * 把 tag 解析成实际的 .srs 绝对路径
+ *
+ * 规则集有两个存放位置：
+ *   /etc/sing-box/rules/*.srs            → geosite-*, geoip-*  （sing-box geosite export 产物）
+ *   /etc/sing-box/rules/semantic/*.srs   → direct/block/media/proxy/... （从 OpenClash 迁移的语义化分组）
+ *
+ * 先查主目录，再查 semantic 子目录；都存在时以主目录优先。
+ * tag 必须已经过 safe_tag() 校验，这里不再重复校验（但路径仍是白名单拼接）。
+ */
+function ruleset_path(tag) {
+	const p1 = `${RULES_DIR}/${tag}.srs`;
+	if (access(p1) != null)
+		return p1;
+
+	const p2 = `${RULES_DIR}/semantic/${tag}.srs`;
+	if (access(p2) != null)
+		return p2;
+
+	return null;
+}
+
+/*
+ * 配置写操作互斥锁
+ *
+ * 场景：两个浏览器标签页同时点保存 → read-modify-write 竞态 → A 的改动被 B 覆盖。
+ * 实现：用 mkdir 做原子互斥（busybox 有 mkdir，$? 可靠，不需要额外依赖）。
+ */
+const CONF_LOCK = '/tmp/singbox-luci.lock';
+
+function with_lock(fn) {
+	let i = 0;
+
+	for (i = 0; i < 50; i++) {          /* 最多等 5 秒 */
+		if (system(`mkdir ${shellquote(CONF_LOCK)} 2>/dev/null`) === 0)
+			break;
+		system('sleep 0.1');
+	}
+
+	if (i >= 50)
+		return { ok: false, error: '另一个保存操作正在进行，请稍后重试' };
+
+	let res;
+	try {
+		res = fn();
+	}
+	catch (e) {
+		res = { ok: false, error: `${e}` };
+	}
+
+	system(`rmdir ${shellquote(CONF_LOCK)} 2>/dev/null`);
+	return res;
+}
+
+/*
+ * 清理插件的临时文件
+ *
+ * 插件在 /tmp 下会产生几类文件（tmpfs，重启即清空，但运行期会累积）：
+ *   sb-rs-count-<tag>     规则集条目数缓存（每个 ≤8 字节，但 tag 变更后会残留）
+ *   sb-rs-<tag>.json      反编译出的 JSON 明文（大！geosite-!cn 可达 1MB+）
+ *   sb-rs-save-<tag>.*    保存时的临时文件
+ *   sb-probe-<i>.json     访问检查探针结果
+ *   sb-ipcache.json       出口 IP 缓存
+ *   singbox-luci.lock     写操作互斥目录
+ *
+ * 触发时机：
+ *   1. 每次 ruleset_save 成功后（清理该 tag 的缓存）
+ *   2. 由 service RPC 的 lightweight cleanup 定期调用（前端进入 rules 页时）
+ */
+function cleanup_tmp(what) {
+	/* what: 'all' 全清 | 'decompile' 只清反编译明文（最占空间） */
+	let removed = 0;
+
+	const patterns = (what == 'decompile')
+		? [ '/tmp/sb-rs-*.json', '/tmp/sb-rs-save-*' ]
+		: [ '/tmp/sb-rs-*.json', '/tmp/sb-rs-save-*', '/tmp/sb-probe-*',
+		    '/tmp/sb-ipcache.json' ];
+
+	for (let pat in patterns) {
+		const list = popen(`ls -1 ${pat} 2>/dev/null`, 'r')?.read('all') ?? '';
+		for (let f in split(trim(list), '\n')) {
+			if (!length(f))
+				continue;
+			if (unlink(f) != null)
+				removed++;
+		}
+	}
+
+	/* 锁目录残留（进程被 kill 时会留下） */
+	if (system(`rmdir ${shellquote(CONF_LOCK)} 2>/dev/null`) === 0)
+		removed++;
+
+	return removed;
+}
+
+/*
+ * 清理陈旧的规则集计数缓存
+ *
+ * sb-rs-count-<tag> 的 tag 应当来自当前 ruleset_list()。
+ * 规则集被删/改名后，对应缓存就变成孤儿，需要清掉。
+ */
+function cleanup_stale_counts() {
+	/*
+	 * 判定"存活 tag"直接扫文件系统，不调用 ruleset_list()。
+	 *
+	 * 原因：ruleset_list() 内部会做 stat + readfile，在 rpcd 沙箱里某些路径
+	 * 可能失败；而这里只需要 tag 集合，扫 .srs 文件名最轻也最可靠。
+	 * （踩过的坑：早前版本在 ruleset_list() 里调用本函数，会形成递归。）
+	 */
+	const alive = {};
+	const dirs = [ RULES_DIR, `${RULES_DIR}/semantic` ];
+
+	for (let d in dirs) {
+		const files = popen(`ls -1 ${d}/*.srs 2>/dev/null`, 'r')?.read('all') ?? '';
+		for (let f in split(trim(files), '\n')) {
+			if (!length(f))
+				continue;
+			alive[replace(basename(f), '.srs', '')] = true;
+		}
+	}
+
+	/* 清理孤儿计数缓存 */
+	const cntFiles = popen('ls -1 /tmp/sb-rs-count-* 2>/dev/null', 'r')?.read('all') ?? '';
+	let removed = 0;
+
+	for (let f in split(trim(cntFiles), '\n')) {
+		if (!length(f))
+			continue;
+		const tag = replace(basename(f), 'sb-rs-count-', '');
+		if (!alive[tag]) {
+			try { if (unlink(f) != null) removed++; }
+			catch (e) { /* 忽略单个文件失败 */ }
+		}
+	}
+
+	return removed;
+}
+
+function urlencode(s) {
+	const unreserved = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~';
+	let out = '';
+
+	for (let i = 0; i < length(s); i++) {
+		const c = substr(s, i, 1);
+		/* 注意：hexenc() 返回**小写**十六进制，而 URL 编码约定用大写。
+		 * sing-box 的 Clash API 对 %XX 大小写不敏感，但部分实现会拒绝小写，
+		 * 为兼容性统一转大写。 */
+		out += (index(unreserved, c) !== -1) ? c : `%${uc(hexenc(c))}`;
+	}
+
+	return out;
+}
+
+/* 读取 Clash API secret（从配置文件读取，不硬编码） */
+/* 读取 Clash API 配置（secret / host / port 全部从 sing-box 配置动态取，
+ * 不硬编码，便于在任意设备与任意端口组合上使用） */
+function clash_api_conf() {
+	const raw = readfile(CONF);
+	if (!raw) return null;
+
+	let cfg;
+	try { cfg = json(raw); } catch (e) { return null; }
+
+	const api = cfg?.experimental?.clash_api;
+	if (!api) return null;
+
+	let host = '127.0.0.1';
+	let port = 9090;
+
+	const ctl = api.external_controller ?? '';
+	if (length(ctl)) {
+		const idx = rindex(ctl, ':');
+		if (idx > 0) {
+			host = substr(ctl, 0, idx);
+			port = int(substr(ctl, idx + 1)) || port;
+		} else {
+			port = int(ctl) || port;
+		}
+	}
+
+	/* 允许通过 cache_file 之外的 override 文件自定义（可选） */
+	if (length(host) === 0 || host === '0.0.0.0')
+		host = '127.0.0.1';
+
+	return { host: host, port: port, secret: api.secret ?? '' };
+}
+
+function clash_secret() {
+	const c = clash_api_conf();
+	return c ? c.secret : null;
+}
+
+/* 调用 Clash API（通过 wget 子进程，因 ucode 无 HTTP 模块） */
+function clash_request(method, path, body) {
+	const secret = clash_secret();
+	if (secret === null)
+		return { ok: false, error: '无法读取 Clash API 配置' };
+
+	const api = clash_api_conf() ?? { host: CLASH_HOST, port: CLASH_PORT };
+	const h = api.host;
+	const p = api.port;
+	const url = `http://${h}:${p}${path}`;
+	/* ★ 安全：secret 必须经 shellquote，否则含单引号时会闭合引号导致命令注入 */
+	const auth = secret ? `--header=${shellquote(`Authorization: Bearer ${secret}`)}` : '';
+	let cmd;
+
+	if (method === 'GET') {
+		/*
+		 * Clash 的 /traffic 是持续推送的流式接口，永不主动关闭。
+		 * busybox wget 会缓冲输出，且流刚建立时首帧可能是初始 0，
+		 * 因此这里刻意读多行并只保留**最后一行**（即最新的真实差值），
+		 * 再用 head 触发 SIGPIPE 结束 wget，避免阻塞 uhttpd。
+		 * 其它接口有明确 EOF，直接 limit 兜底即可。
+		 */
+		let trunc;
+		let to;
+
+		if (path === '/traffic') {
+			trunc = 'head -n 2 | tail -n 1';   /* 第2行即真实差值，≈1s */
+			to = 4;
+		} else {
+			trunc = 'head -c 262144';
+			to = match(path, /\/delay/) ? 10 : 4;   /* 测速内部等待可达 5s */
+		}
+
+		cmd = `wget -qO- -T ${to} ${auth} ${shellquote(url)} 2>/dev/null | ${trunc}`;
+	} else {
+		/*
+		 * ★ 关键：BusyBox wget 不支持 PUT/PATCH/DELETE（无 --method 参数），
+		 * 而 sing-box 的 Clash API 选节点要求 PUT /proxies/{name}。
+		 * 用 wget --post-data 会退化成 POST → 服务端返回 405 且无响应体，
+		 * 被误判为成功（这就是「切换节点/模式看起来 ok 但实际不生效」的根因）。
+		 *
+		 * 解决：用 BusyBox nc 手写 HTTP 报文。nc 仅支持 `nc IP PORT`，
+		 * 但足以通过 stdin 发送完整请求。
+		 */
+		/* 用紧凑 JSON：sprintf('%J') 会带空格，虽合法但便于排查时统一 */
+		const payload = body != null
+			? (type(body) === 'string' ? body : sprintf('%J', body))
+			: '';
+
+		/* Content-Length 必须是**字节数**（中文 UTF-8 每字 3 字节），
+		 * 用 length() 得到的是字符数，故用 shell 的 wc -c 精确计算。 */
+		/*
+		 * ★ 关键陷阱：URL 里含 %XX 转义（如 %F0%9F...），
+		 * 若把 path 直接拼进 printf 的**格式字符串**，%F 会被当成浮点格式符，
+		 * 导致 "sh: ...: invalid format" 且请求行被破坏 → 服务端 400。
+		 * 因此路径必须作为 printf 的参数传入（格式串里只留 %s）。
+		 */
+		cmd = `BODY=${shellquote(payload)}; ` +
+		      `L=$(printf '%s' "$BODY" | wc -c); ` +
+		      `{ printf '%s %s HTTP/1.1\\r\\n' '${method}' ${shellquote(path)}; ` +
+		      `  printf 'Host: %s:%s\\r\\n' ${shellquote(h)} '${p}'; ` +
+		      `  printf 'Authorization: Bearer %s\\r\\n' ${shellquote(secret)}; ` +
+		      `  printf 'Content-Type: application/json\\r\\n'; ` +
+		      `  printf 'Content-Length: %s\\r\\n' "$L"; ` +
+		      `  printf 'Connection: close\\r\\n\\r\\n'; ` +
+		      `  printf '%s' "$BODY"; ` +
+		      `} | nc ${shellquote(h)} ${shellquote(`${p}`)} 2>/dev/null | head -c 8192`;
+	}
+
+	const out = popen(cmd, 'r')?.read('all') ?? '';
+
+	/* 非 GET：解析 HTTP 状态码判断成败（nc 会连响应头一起返回） */
+	if (method !== 'GET') {
+		const m = match(out, /^HTTP\/[0-9.]+ ([0-9]{3})/);
+		if (m) {
+			const code = int(m[1]);
+			if (code >= 200 && code < 300)
+				return { ok: true };
+			const msgm = match(out, /\r\n\r\n(.+)$/);
+			return {
+				ok: false,
+				error: `HTTP ${code}` + (msgm ? ': ' + trim(msgm[1]) : '')
+			};
+		}
+		/* 无响应体/无法解析：保守判定失败，避免假成功 */
+		if (length(trim(out)) === 0)
+			return { ok: false, error: 'Clash API 无响应' };
+		return { ok: true };
+	}
+
+	if (length(out) === 0) {
+		/* 测速接口无响应 = Clash 返回 503，即该节点测速失败（不可达/超时）。
+		 * busybox wget 在 HTTP 错误时会丢弃响应体，故此处只能据空体判定。 */
+		if (match(path, /\/delay/))
+			return { ok: false, error: '节点不可达（测速失败或超时）' };
+
+		return { ok: false, error: 'Clash API 无响应' };
+	}
+
+	try {
+		return { ok: true, data: json(out) };
+	} catch (e) {
+		/* 非 JSON 响应（如 /traffic 单行、204） */
+		return { ok: true, data: trim(out) };
+	}
+}
+
+/* 读取主配置（解析后对象） */
+function read_config() {
+	const raw = readfile(CONF);
+	if (!raw)
+		return null;
+	try {
+		return json(raw);
+	} catch (e) {
+		return null;
+	}
+}
+
+/* 备份当前配置 */
+function backup_config() {
+	const raw = readfile(CONF);
+	if (!raw)
+		return false;
+	return writefile(CONF_BAK, raw) != null;
+}
+
+/* 校验配置语法 */
+function check_config(path) {
+	const out = popen(`/usr/bin/sing-box check -c ${shellquote(path)} 2>&1`, 'r')?.read('all') ?? '';
+	/* 过滤已知的无害弃用警告 */
+	const lines = filter(split(trim(out), '\n'), (l) =>
+		length(l) > 0 && !match(l, /legacy domain strategy|deprecated/));
+	return { ok: length(lines) === 0, message: join('\n', lines) };
+}
+
+/* 原子写入配置：校验通过才替换 */
+function apply_config(cfg) {
+	/* ★ 原子写入：先写临时文件 → 校验 → 备份 → mv（同文件系统内原子替换）
+	 *   直接 writefile(CONF) 会在掉电/overlay 写满时留下被截断的 config.json，
+	 *   sing-box 起不来且只能手工恢复。 */
+	const tmp = '/tmp/singbox-config-new.json';
+	const body = sprintf('%J', cfg);
+
+	if (writefile(tmp, body) == null)
+		return { ok: false, error: '临时文件写入失败' };
+
+	const chk = check_config(tmp);
+	if (!chk.ok) {
+		unlink(tmp);
+		return { ok: false, error: `配置校验失败: ${chk.message}` };
+	}
+
+	if (!backup_config()) {
+		unlink(tmp);
+		return { ok: false, error: '配置备份失败，已中止' };
+	}
+
+	const rc = system(`mv ${shellquote(tmp)} ${shellquote(CONF)} 2>&1`);
+	if (rc !== 0) {
+		unlink(tmp);
+		return { ok: false, error: '配置写入失败' };
+	}
+
+	return { ok: true };
+}
+
+function reload_service() {
+	/* ★ 用 system() 拿退出码，不再无脑返回 true。
+	 *   原实现 popen + return true 会在重启失败时假报成功，
+	 *   用户以为改好了其实服务没起来。 */
+	const rc = system(`${INIT} restart >/dev/null 2>&1`);
+	return { ok: rc === 0, code: rc };
+}
+
+function reload_service_async() {
+	/* 重启耗时约 8s，超过部分 RPC 的耐心。需要"尽快返回"的场景用这个，
+	 * 前端随后轮询 service_status 确认。 */
+	system(`${INIT} restart >/dev/null 2>&1 &`);
+	return { ok: true, accepted: true };
+}
+
+function service_status() {
+	const running = (system(`${INIT} status >/dev/null 2>&1`) === 0);
+	const enabled = (system(`${INIT} enabled >/dev/null 2>&1`) === 0);
+	return { running, enabled };
+}
+
+/* 节点类型白名单（仅这些类型走可视化编辑） */
+const NODE_TYPES = [
+	'hysteria2', 'vless', 'vmess', 'tuic',
+	'trojan', 'shadowsocks', 'socks', 'http', 'wireguard', 'anytls'
+];
+
+function is_node(ob) {
+	return ob && index(NODE_TYPES, ob.type) !== -1;
+}
+
+/* 脱敏：移除凭据字段，前端只用于展示 */
+function sanitize_node(ob) {
+	const copy = { ...ob };
+	for (let k in ['password', 'uuid', 'auth', 'private_key', 'public_key', 'short_id']) {
+		if (copy[k] != null)
+			copy[k] = '__SET__';
+	}
+	if (copy.users) {
+		copy.users = map(copy.users, (u) => {
+			const uc = { ...u };
+			for (let k in ['password', 'uuid'])
+				if (uc[k] != null) uc[k] = '__SET__';
+			return uc;
+		});
+	}
+	if (copy.tls) {
+		copy.tls = { ...copy.tls };
+		for (let k in ['certificate_path', 'key_path'])
+			if (copy.tls[k] != null) copy.tls[k] = '__SET__';
+		if (copy.tls.reality) {
+			copy.tls.reality = { ...copy.tls.reality };
+			if (copy.tls.reality.private_key) copy.tls.reality.private_key = '__SET__';
+		}
+	}
+	return copy;
+}
+
+/* ───────────────────────── RPC 方法 ───────────────────────── */
+
+/* ─────────────────────────────────────────────
+ * 规则集（.srs）明细读写
+ *
+ * .srs 是二进制格式，用 `sing-box rule-set decompile` 转 JSON 明文，
+ * 编辑后再用 `rule-set compile` 编译回二进制。
+ * pi-b* / geosite-* / geoip-* 都适用。
+ * ───────────────────────────────────────────── */
+
+/* 列出所有规则集及其条目数
+ * ★ 只读缓存，不主动反编译：31 个文件全量反编译需 >30s，会被 rpcd 超时杀掉。
+ *   条目数由 ruleset_read（用户点击展开时）按需计算并写缓存。
+ */
+function ruleset_list() {
+	let out = [];
+	let seen = {};
+
+	/* 两个目录都要列：主目录（geosite/geoip）+ semantic 子目录（语义化分组） */
+	const dirs = [ RULES_DIR, `${RULES_DIR}/semantic` ];
+
+	for (let d in dirs) {
+		/* 注意：通配符展开靠 shell，路径本身是常量，无注入风险 */
+		const files = popen(`ls -1 ${d}/*.srs 2>/dev/null`, 'r')?.read('all') ?? '';
+
+		for (let f in split(trim(files), '\n')) {
+			if (!length(f))
+				continue;
+
+			const tag = replace(basename(f), '.srs', '');
+
+			/* 同名 tag 只保留第一个（主目录优先） */
+			if (seen[tag])
+				continue;
+			seen[tag] = true;
+
+			let sz = 0;
+			const szs = trim(popen(`stat -c %s ${shellquote(f)} 2>/dev/null`, 'r')?.read('all') ?? '');
+			sz = int(szs) || 0;
+
+			const cached = readfile(`/tmp/sb-rs-count-${tag}`);
+			push(out, {
+				tag,
+				file: basename(f),
+				group: (d == RULES_DIR) ? '' : 'semantic',
+				bytes: sz,
+				count: cached != null ? (int(trim(cached)) || 0) : -1   /* -1 = 未统计 */
+			});
+		}
+	}
+
+	return out;
+}
+
+/* 读取规则集明细（扁平化为可编辑条目） */
+function ruleset_read(tag) {
+	/* ★ 安全：tag 来自前端，必须校验后才能拼进 shell 命令和路径 */
+	const t = safe_tag(tag);
+	if (t == null)
+		return null;
+
+	/* ★ 单次返回上限：防止 geosite-cn 这类上万条规则一次性序列化
+	 *   把 rpcd 撑爆（K3 只有 512MB RAM，ucode 侧全量对象会很吃内存）。 */
+	const ITEM_LIMIT = 5000;
+
+	const src = `/tmp/sb-rs-${t}.json`;
+	if (access(src) == null) {
+		const srs = ruleset_path(t);
+		if (srs == null)
+			return null;
+		if (system(`sing-box rule-set decompile ${shellquote(srs)} -o ${shellquote(src)} >/dev/null 2>&1`) !== 0)
+			return null;
+	}
+
+	const body = readfile(src);
+	if (body == null)
+		return null;
+
+	let d;
+	try { d = json(body); } catch (e) { return null; }
+
+	/* 扁平化并统计总数，超过 ITEM_LIMIT 只返回前面的部分 */
+	let items = [];
+	let total = 0;
+
+	for (let r in d.rules) {
+		for (let k in r) {
+			const v = r[k];
+			const vals = (type(v) === 'array') ? v : [ `${v}` ];
+			total += length(vals);
+
+			for (let x in vals) {
+				if (length(items) >= ITEM_LIMIT)
+					continue;
+				push(items, { type: k, value: `${x}` });
+			}
+		}
+	}
+
+	/* 缓存总数，供 ruleset_list 显示（不再需要 decompile 就能看到条数） */
+	writefile(`/tmp/sb-rs-count-${t}`, `${total}`);
+
+	return { tag: t, items, total, truncated: total > ITEM_LIMIT, limit: ITEM_LIMIT };
+}
+
+
+/* 保存规则集明细：items → JSON rules → compile → .srs */
+function ruleset_save(tag, items) {
+	/* ★ 安全：tag 来自前端，必须校验 */
+	const t = safe_tag(tag);
+	if (t == null)
+		return { ok: false, error: '规则集名称非法' };
+
+	if (type(items) !== 'array')
+		return { ok: false, error: '条目格式错误' };
+
+	/* 按类型分组，每类聚合成一个 rule 对象
+	 * 注意：内层变量用 itype，避免与外层的安全校验结果 t 冲突 */
+	let byType = {};
+	for (let it in items) {
+		const itype = it?.type;
+		const v = it?.value;
+		if (itype == null || !length(`${itype}`) || v == null || !length(`${v}`))
+			continue;
+		byType[itype] = byType[itype] ?? [];
+		push(byType[itype], `${v}`);
+	}
+
+	let rules = [];
+	for (let itype in keys(byType))
+		push(rules, { [itype]: byType[itype] });
+
+	const srcPath = `/tmp/sb-rs-save-${t}.json`;
+	const binPath = `/tmp/sb-rs-save-${t}.srs`;
+	const payload = sprintf('%J', { version: 1, rules });
+
+	if (writefile(srcPath, payload) == null)
+		return { ok: false, error: '临时文件写入失败' };
+
+	/* 编译为二进制 */
+	const rc = system(`sing-box rule-set compile ${shellquote(srcPath)} -o ${shellquote(binPath)} >/dev/null 2>&1`);
+	if (rc !== 0)
+		return { ok: false, error: '规则集编译失败（格式错误？）' };
+
+	const st = stat(binPath);
+	if (!st || st.size === 0)
+		return { ok: false, error: '编译产物为空' };
+
+	/* 备份原文件后覆盖 */
+	/* 写回原位置（主目录或 semantic 子目录） */
+	const target = ruleset_path(t);
+	if (target == null)
+		return { ok: false, error: '规则集不存在' };
+
+	const bak = `${target}.bak-luci`;
+	system(`cp ${shellquote(target)} ${shellquote(bak)} 2>/dev/null`);
+	if (system(`cp ${shellquote(binPath)} ${shellquote(target)}`) !== 0)
+		return { ok: false, error: '写入规则集失败' };
+
+	/* 清理缓存 */
+	unlink(`/tmp/sb-rs-count-${t}`);
+	unlink(`/tmp/sb-rs-${t}.json`);
+
+	const rl = reload_service();
+	if (!rl.ok)
+		return { ok: false, error: `规则集已保存但服务重启失败（code ${rl.code}），请检查日志` };
+	return { ok: true, count: length(items) };
+}
+
+
+function rules_merge(rules) {
+	let order = [];          /* 出站首次出现顺序 */
+	let buckets = {};        /* 出站 → 规则数组 */
+	let passthrough = [];    /* 不可合并的规则（action 类 / 单条特殊） */
+
+	for (let i = 0; i < length(rules); i++) {
+		const r = rules[i];
+
+		/* action 类（hijack-dns / sniff 等）不参与合并，保持原位 */
+		if (r.action && !r.outbound) {
+			/* action 类规则（hijack-dns / sniff / reject…）必须保持原位置 */
+			push(order, { type: 'raw', idx: i, rule: r });
+			continue;
+		}
+
+		const key = r.outbound ?? 'DIRECT';
+		if (buckets[key] == null) {
+			buckets[key] = [];
+			push(order, { type: 'group', key });
+		}
+		push(buckets[key], r);
+	}
+
+	/* 复用 config 中已定义的 rule_set（任何合法 tag 都必须存在） */
+	let out = [];
+	for (let o in order) {
+		if (o.type === 'raw') {
+			push(out, o.rule);
+			continue;
+		}
+
+		const arr = buckets[o.key];
+		if (length(arr) === 1) {
+			push(out, arr[0]);
+			continue;
+		}
+
+		/*
+		 * ★ 合并前安全检查（不安全的直接逐条保留，宁可多几条规则）
+		 *
+		 * 1) 布尔键冲突：同一出站内一条 ip_is_private:true、一条 false，
+		 *    合并时后者覆盖前者必然错一条。
+		 * 2) 多条件类型混并：sing-box 同一个 rule 对象内的多个条件键是 AND 语义。
+		 *    把 {rule_set:[A]} 和 {domain_suffix:[B]} 合成一条会让
+		 *    「A 或 B」变成「A 且 B」，直接改变分流结果。
+		 *
+		 * 只有「全部是 rule_set 键」或「全部是同一入口类型」时才合并。
+		 */
+		let boolConflict = false;
+		let seenBool = {};
+		let keyKinds = {};
+
+		for (let r in arr) {
+			for (let k in r) {
+				if (k === 'outbound')
+					continue;
+
+				const v = r[k];
+				if (type(v) === 'bool' || type(v) === 'boolean') {
+					if (seenBool[k] != null && seenBool[k] !== v)
+						boolConflict = true;
+					seenBool[k] = v;
+				}
+				else {
+					keyKinds[k] = (keyKinds[k] ?? 0) + 1;
+				}
+			}
+		}
+
+		const kindList = keys(keyKinds);
+		const onlyRuleSet = (length(kindList) === 1 && kindList[0] === 'rule_set');
+		const sameKindOnly = (length(kindList) <= 1);
+
+		if (boolConflict || (!onlyRuleSet && !sameKindOnly)) {
+			/* 不安全：原样保留，不合并 */
+			for (let r in arr)
+				push(out, r);
+			continue;
+		}
+
+		/* 同出站多条 → 合并：rule_set 归并为一个数组，其他键按类型归并 */
+		let merged = { outbound: o.key };
+		let sets = [];
+		let byKey = {};
+
+		for (let r in arr) {
+			for (let k in r) {
+				if (k === 'outbound') continue;
+				if (k === 'rule_set') {
+					for (let t in r[k])
+						if (index(sets, t) === -1) push(sets, t);
+					continue;
+				}
+				/* ★ 布尔型键（如 ip_is_private: true）不能聚合成数组，
+				 * 否则 sing-box 报 "cannot unmarshal array into Go value of type bool"。
+				 * 布尔条件的语义是所有命中项都满足，合并时保留 true 即可。 */
+				const v = r[k];
+
+				/* ★ ucode 的类型名是 'bool'（不是 JS 的 'boolean'） */
+				if (type(v) === 'bool' || type(v) === 'boolean') {
+					byKey[k] = v;   /* 保留布尔值本身 */
+					continue;
+				}
+
+				byKey[k] = byKey[k] ?? [];
+				if (type(v) === 'array') {
+					for (let x in v)
+						if (index(byKey[k], x) === -1) push(byKey[k], x);
+				} else {
+					if (index(byKey[k], v) === -1) push(byKey[k], v);
+				}
+			}
+		}
+
+		if (length(sets)) merged.rule_set = sets;
+		for (let k in keys(byKey)) merged[k] = byKey[k];   /* 布尔值原样，数组已聚合 */
+
+		push(out, merged);
+	}
+
+	return out;
+}
+
+
+/* ─────────────────────────────────────────────
+ * Clash API 短 TTL 缓存
+ *
+ * 总览页每 3 秒轮询 /traffic，但一次渲染会同时请求
+ * /proxies、/traffic、/connections，造成重复调用。
+ * 用 500ms 内存缓存合并同一轮询周期内的重复请求。
+ * ───────────────────────────────────────────── */
+const _clash_cache = {};
+const CLASH_CACHE_TTL = 500;   /* ms */
+
+function clash_get_cached(path) {
+	const now = time();
+	const hit = _clash_cache[path];
+
+	if (hit && (now - hit.at) < CLASH_CACHE_TTL)
+		return hit.val;
+
+	const val = clash_request('GET', path);
+	_clash_cache[path] = { at: now, val: val };
+	return val;
+}
+
+
+const methods = {
+
+	/* ── 总览：服务 + 版本 + 模式 + 节点数 ── */
+	status: {
+		args: {},
+		call: function() {
+			const svc = service_status();
+			const cfg = read_config();
+			const ver = clash_request('GET', '/version');
+			const confs = clash_request('GET', '/configs');
+
+			let node_count = 0;
+			if (cfg?.outbounds)
+				node_count = length(filter(cfg.outbounds, is_node));
+
+			let rule_count = length(cfg?.route?.rules ?? []);
+
+			return {
+				running: svc.running,
+				enabled: svc.enabled,
+				version: ver.ok ? ver.data?.version : null,
+				mode: confs.ok ? confs.data?.mode : null,
+				node_count,
+				rule_count,
+				clash_ok: ver.ok
+			};
+		}
+	},
+
+	/* ── Clash API 只读代理（路径白名单） ── */
+	clash_get: {
+		args: { path: 'string' },
+		call: function(req) {
+			const allowed = ['/proxies', '/connections', '/traffic', '/configs', '/version'];
+			const p = req.args?.path;
+			/* 白名单内用短 TTL 缓存，减少重复请求 */
+
+			if (index(allowed, p) === -1)
+				return { ok: false, error: '不允许的路径' };
+
+			/* /traffic 是流式接口，不缓存；其余走 500ms 缓存 */
+			if (p === '/traffic')
+				return clash_request('GET', p);
+
+			return clash_get_cached(p);
+		}
+	},
+
+	/* ── 切换模式 rule / global / direct ── */
+	set_mode: {
+		args: { mode: 'string' },
+		call: function(req) {
+			const mode = req.args?.mode;
+			if (index(['rule', 'global', 'direct'], mode) === -1)
+				return { ok: false, error: '非法模式' };
+			return clash_request('PATCH', '/configs', { mode });
+		}
+	},
+
+	/* ── 选择节点（Selector 组切换） ── */
+	select_node: {
+		args: { group: 'string', name: 'string' },
+		call: function(req) {
+			const group = req.args?.group;
+			const name = req.args?.name;
+			if (!group || !name)
+				return { ok: false, error: '参数缺失' };
+			return clash_request('PUT', `/proxies/${urlencode(group)}`, { name });
+		}
+	},
+
+	/* ── 测速单个节点 ── */
+	test_node: {
+		args: { name: 'string' },
+		call: function(req) {
+			const name = req.args?.name;
+			if (!name)
+				return { ok: false, error: '参数缺失' };
+
+			const path = `/proxies/${urlencode(name)}/delay` +
+			             `?timeout=5000&url=${urlencode('http://www.gstatic.com/generate_204')}`;
+			return clash_request('GET', path);
+		}
+	},
+
+	/* ── 列出节点（脱敏） ── */
+	nodes_list: {
+		args: {},
+		call: function() {
+			const cfg = read_config();
+			if (!cfg)
+				return { ok: false, error: '配置读取失败' };
+
+			let nodes = [];
+			for (let i = 0; i < length(cfg.outbounds ?? []); i++) {
+				const ob = cfg.outbounds[i];
+				if (is_node(ob)) {
+					push(nodes, {
+						index: i,
+						tag: ob.tag,
+						type: ob.type,
+						server: ob.server ?? '',
+						port: ob.server_port ?? ob.port ?? '',
+						detail: sanitize_node(ob)
+					});
+				}
+			}
+
+			/* 同时列出 selector/urltest 组，供前端做切换 */
+			let groups = [];
+			for (let ob in (cfg.outbounds ?? [])) {
+				if (ob.type === 'selector' || ob.type === 'urltest') {
+					push(groups, {
+						tag: ob.tag,
+						type: ob.type,
+						members: ob.outbounds ?? []
+					});
+				}
+			}
+
+			return { ok: true, nodes, groups };
+		}
+	},
+
+	/* ── 保存节点（新增或按原 tag 更新） ── */
+	node_save: {
+		args: { node: 'string', original_tag: 'string' },
+		call: function(req) {
+			/* rpcd 对 object 类型支持有限，前端以 JSON 字符串传输 */
+			let node = req.args?.node;
+			if (type(node) === 'string') {
+				try { node = json(node); } catch (e) { return { ok: false, error: '节点 JSON 解析失败' }; }
+			}
+
+			const orig = req.args?.original_tag;
+
+			if (!node || !node.tag || !node.type)
+				return { ok: false, error: '节点缺少 tag 或 type' };
+			if (index(NODE_TYPES, node.type) === -1)
+				return { ok: false, error: '不支持的节点类型' };
+
+			/* ★ 整个 read-modify-write 过程加锁，防并发丢更新 */
+			return with_lock(function() {
+			const cfg = read_config();
+			if (!cfg)
+				return { ok: false, error: '配置读取失败' };
+
+			cfg.outbounds = cfg.outbounds ?? [];
+			let found = -1;
+
+			/* 按原始 tag 定位（编辑场景），未提供 original_tag 则为新增 */
+			if (orig && length(`${orig}`)) {
+				for (let i = 0; i < length(cfg.outbounds); i++) {
+					if (cfg.outbounds[i].tag === orig) {
+						found = i;
+						break;
+					}
+				}
+				if (found < 0)
+					return { ok: false, error: `未找到要修改的节点「${orig}」` };
+			}
+
+			/* ★ 同名冲突检查：改名成已存在的 tag 会静默覆盖掉那个节点 */
+			for (let i = 0; i < length(cfg.outbounds); i++) {
+				if (i !== found && cfg.outbounds[i].tag === node.tag)
+					return { ok: false, error: `已存在同名节点「${node.tag}」` };
+			}
+
+			/* ★ 凭据继承：前端用 __SET__ 占位表示"未修改，沿用原值"。
+			 *   前端 nodes.js 会同时传 __keep_secret__: true。
+			 *   原实现只在前端置了这个标记、后端完全没处理，
+			 *   导致编辑任何节点都会把凭据写成字面量 "__SET__" 而失效。 */
+			if (found >= 0 && node.__keep_secret__) {
+				const old = cfg.outbounds[found];
+
+				for (let k in [ 'password', 'uuid', 'auth', 'private_key', 'public_key', 'short_id' ]) {
+					if (old[k] != null && (node[k] == null || node[k] === '__SET__'))
+						node[k] = old[k];
+				}
+
+				/* users[]（shadowsocks 多用户） */
+				if (type(node.users) === 'array' && type(old.users) === 'array') {
+					for (let i = 0; i < length(node.users); i++) {
+						if (node.users[i]?.password === '__SET__' && old.users[i]?.password != null)
+							node.users[i].password = old.users[i].password;
+					}
+				}
+
+				/* tls 相关 */
+				if (node.tls != null && old.tls != null) {
+					for (let k in [ 'certificate_path', 'key_path' ])
+						if (node.tls[k] === '__SET__' && old.tls[k] != null)
+							node.tls[k] = old.tls[k];
+
+					if (node.tls.reality?.private_key === '__SET__' && old.tls.reality?.private_key != null)
+						node.tls.reality.private_key = old.tls.reality.private_key;
+				}
+			}
+
+			/* ★ 内部标记绝不能落进 config.json（sing-box schema 严格校验未知字段） */
+			delete node.__keep_secret__;
+
+			if (found >= 0) {
+				/* ★ 改名：同步更新所有 selector/urltest 的 outbounds 引用、
+				 *   route.rules[].outbound 以及 route.final。
+				 *   原实现不更新引用 → sing-box check 报 "outbound not found"
+				 *   → 保存失败且错误信息完全不提示原因。 */
+				if (orig && orig !== node.tag) {
+					for (let ob in cfg.outbounds) {
+						if (type(ob.outbounds) === 'array')
+							ob.outbounds = map(ob.outbounds, (m) => (m === orig) ? node.tag : m);
+					}
+					for (let r in (cfg.route?.rules ?? []))
+						if (r.outbound === orig)
+							r.outbound = node.tag;
+					if (cfg.route?.final === orig)
+						cfg.route.final = node.tag;
+				}
+				cfg.outbounds[found] = node;
+			}
+			else
+				push(cfg.outbounds, node);
+
+			const res = apply_config(cfg);
+			if (!res.ok)
+				return res;
+
+			const rl = reload_service();
+			if (!rl.ok)
+				return { ok: false, error: `配置已保存但服务重启失败（code ${rl.code}），请检查日志` };
+			return { ok: true };
+			});
+		}
+	},
+
+	/* ── 删除节点 ── */
+	node_delete: {
+		args: { tag: 'string' },
+		call: function(req) {
+			const tag = req.args?.tag;
+			if (!tag)
+				return { ok: false, error: '参数缺失' };
+
+			const cfg = read_config();
+			if (!cfg)
+				return { ok: false, error: '配置读取失败' };
+
+			const before = length(cfg.outbounds ?? []);
+			cfg.outbounds = filter(cfg.outbounds ?? [], (ob) => ob.tag !== tag);
+
+			if (length(cfg.outbounds) === before)
+				return { ok: false, error: '未找到该节点' };
+
+			/* 同步从 urltest/selector 成员中移除 */
+			for (let ob in cfg.outbounds) {
+				if (ob.outbounds)
+					ob.outbounds = filter(ob.outbounds, (m) => m !== tag);
+			}
+
+			const res = apply_config(cfg);
+			if (!res.ok)
+				return res;
+
+			const rl = reload_service();
+			if (!rl.ok)
+				return { ok: false, error: `配置已保存但服务重启失败（code ${rl.code}），请检查日志` };
+			return { ok: true };
+		}
+	},
+
+	/* ── 列出分流规则 ── */
+	ruleset_list: {
+		args: {},
+		call: function() {
+			return { ok: true, list: ruleset_list() };
+		}
+	},
+
+	ruleset_read: {
+		args: { tag: 'string' },
+		call: function(req) {
+			const tag = req.args?.tag;
+			if (!tag || !match(tag, /^[A-Za-z0-9._!-]+$/))
+				return { ok: false, error: '规则集名称非法' };
+			const d = ruleset_read(tag);
+			if (d == null)
+				return { ok: false, error: '读取规则集失败' };
+			return { ok: true, items: d.items };
+		}
+	},
+
+	ruleset_save: {
+		args: { tag: 'string', items: 'string' },
+		call: function(req) {
+			const tag = req.args?.tag;
+			let items = req.args?.items;
+			if (!tag || !match(tag, /^[A-Za-z0-9._!-]+$/))
+				return { ok: false, error: '规则集名称非法' };
+			if (type(items) === 'string') {
+				try { items = json(items); } catch (e) { return { ok: false, error: '条目 JSON 解析失败' }; }
+			}
+			if (type(items) !== 'array')
+				return { ok: false, error: '条目必须是数组' };
+			return ruleset_save(tag, items);
+		}
+	},
+
+	rules_merge: {
+		args: {},
+		call: function() {
+			const cfg = read_config();
+			if (!cfg || !cfg.route)
+				return { ok: false, error: '配置读取失败' };
+
+			const before = cfg.route.rules ?? [];
+			const after = rules_merge(before);
+
+			if (length(after) >= length(before))
+				return { ok: true, before: length(before), after: length(after), changed: false };
+
+			cfg.route.rules = after;
+			const res = apply_config(cfg);
+			if (!res.ok) return res;
+			const rl = reload_service();
+			if (!rl.ok)
+				return { ok: false, error: `规则已合并但服务重启失败（code ${rl.code}），请检查日志` };
+
+			return { ok: true, before: length(before), after: length(after), changed: true };
+		}
+	},
+
+	rules_list: {
+		args: {},
+		call: function() {
+			const cfg = read_config();
+			if (!cfg)
+				return { ok: false, error: '配置读取失败' };
+
+			return {
+				ok: true,
+				rules: cfg?.route?.rules ?? [],
+				final: cfg?.route?.final ?? null
+			};
+		}
+	},
+
+	/* ── 保存规则集（整体替换，含顺序） ── */
+	rules_save: {
+		args: { rules: 'string' },
+		call: function(req) {
+			/* rpcd 对 array 类型支持有限，前端以 JSON 字符串传输 */
+			let rules = req.args?.rules;
+			if (type(rules) === 'string') {
+				try { rules = json(rules); } catch (e) { return { ok: false, error: '规则 JSON 解析失败' }; }
+			}
+
+			if (type(rules) !== 'array')
+				return { ok: false, error: '规则必须是数组' };
+
+			const cfg = read_config();
+			if (!cfg)
+				return { ok: false, error: '配置读取失败' };
+
+			cfg.route = cfg.route ?? {};
+			cfg.route.rules = rules;
+
+			const res = apply_config(cfg);
+			if (!res.ok)
+				return res;
+
+			const rl = reload_service();
+			if (!rl.ok)
+				return { ok: false, error: `配置已保存但服务重启失败（code ${rl.code}），请检查日志` };
+			return { ok: true };
+		}
+	},
+
+	/* ── 服务控制 ── */
+	service: {
+		args: { action: 'string' },
+		call: function(req) {
+			const action = req.args?.action;
+			if (index(['start', 'stop', 'restart', 'enable', 'disable'], action) === -1)
+				return { ok: false, error: '非法操作' };
+
+			const code = system(`${INIT} ${action} >/dev/null 2>&1`);
+			const svc = service_status();
+			return { ok: code === 0, status: svc };
+		}
+	},
+
+	/* ── 读取日志（从 Clash API /logs 不易流式，改读系统日志） ── */
+	logs_read: {
+		args: { lines: 'integer' },
+		call: function(req) {
+			let n = int(req.args?.lines ?? 120);
+			if (n < 10) n = 10;
+			if (n > 500) n = 500;
+
+			const out = popen(`logread 2>/dev/null | grep -i 'sing-box' | tail -n ${n}`, 'r')?.read('all') ?? '';
+			return { ok: true, content: out };
+		}
+	},
+
+	/* ── 运行数据（上传/下载/总量/连接/内存/CPU/负载） ── */
+	run_stats: {
+		args: {},
+		call: function() {
+			/* 流量与连接来自 Clash API */
+			const conns = clash_request('GET', '/connections');
+
+			let up_total = 0, down_total = 0, conn_count = 0;
+			if (conns.ok && conns.data && conns.data.connections) {
+				for (let c in conns.data.connections) {
+					up_total   += int(c.upload ?? 0);
+					down_total += int(c.download ?? 0);
+					conn_count++;
+				}
+			}
+
+			/* sing-box 内存占用 */
+			let mem_kb = 0;
+			const status = popen("awk '/VmRSS/{print $2}' /proc/$(pidof sing-box)/status 2>/dev/null", 'r')?.read('all') ?? '';
+			mem_kb = int(trim(status)) || 0;
+
+			/* 系统负载 */
+			let load1 = 0, load5 = 0;
+			const la = readfile('/proc/loadavg') ?? '';
+			const parts = split(trim(la), ' ');
+			load1 = (parts[0] ?? '0') + '';
+			load5 = (parts[1] ?? '0') + '';
+
+			/* CPU 占用（sing-box 进程） */
+			let cpu = 0;
+			const pids = trim(popen("pidof sing-box 2>/dev/null", 'r')?.read('all') ?? '');
+			if (length(pids)) {
+				const pid = split(pids, ' ')[0];
+				const st = readfile(`/proc/${pid}/stat`) ?? '';
+				const f = split(trim(st), ' ');
+				if (length(f) > 15) {
+					const utime = int(f[13]) || 0;
+					const stime = int(f[14]) || 0;
+					cpu = utime + stime;
+				}
+			}
+
+			/*
+			 * ★ 速率：用 /connections 的累计字节做差分
+			 *
+			 * 为什么不直接用 Clash 的 /traffic？
+			 *   它是 SSE 流式接口，永不关闭。busybox wget + head 读取必须等
+			 *   第 2 帧到达（每 1 秒一帧），实测稳定阻塞 3016ms。
+			 *   本方法每 5 秒被轮询一次 → 页面永久卡在"加载中"。
+			 *
+			 * 差分的精度取决于轮询间隔（5s），对「看个大概速率」完全够用。
+			 * 上次采样存在 /tmp/sb-rate-prev.json（tmpfs，重启清空）。
+			 */
+			let up_rate = 0, down_rate = 0;
+			const now = clock(true);
+			const now_ms = now[0] * 1000 + int(now[1] / 1000000);
+
+			const RATE_CACHE = '/tmp/sb-rate-prev.json';
+			const prevRaw = readfile(RATE_CACHE);
+
+			if (prevRaw != null) {
+				try {
+					const prev = json(prevRaw);
+					const dt = (now_ms - int(prev.at)) / 1000;
+					/* dt 太小（<1s）或太大（>60s，页面长时间未开）都不算速率 */
+					if (dt >= 1 && dt <= 60) {
+						const du = up_total - int(prev.up ?? 0);
+						const dd = down_total - int(prev.down ?? 0);
+						/* 计数回绕/连接重置时会变小，此时视为 0 */
+						up_rate   = du >= 0 ? int(du / dt) : 0;
+						down_rate = dd >= 0 ? int(dd / dt) : 0;
+					}
+				} catch (e) { /* 缓存损坏，忽略 */ }
+			}
+
+			writefile(RATE_CACHE, sprintf('%J', {
+				at: now_ms, up: up_total, down: down_total
+			}));
+
+			return {
+				ok: true,
+				up_total, down_total, conn_count,
+				up_rate, down_rate,
+				mem_kb, load1, load5, cpu_ticks: cpu
+			};
+		}
+	},
+
+	/* ── IP 地址检测（多源） ── */
+	ip_check: {
+		args: {},
+		call: function() {
+			/*
+			 * 只做**本地出口**检测（国内源）。
+			 * 代理出口由前端浏览器查询 —— K3 自身流量不经 tproxy，
+			 * 用 wget 走 HTTPS 代理访问境外站会长时间阻塞，无法在 30s 内完成。
+			 *
+			 * ★ 优化：两路并行 + 60 秒内存缓存。
+			 *   原实现串行两次 wget，冷启动（DNS 未缓存）实测 12 秒，
+			 *   直接把 overview 首屏拖到 18 秒。
+			 */
+			const CACHE = '/tmp/sb-ipcache.json';
+			const TTL = 60;
+
+			/* 缓存命中直接返回 */
+			const cachedRaw = readfile(CACHE);
+			if (cachedRaw != null) {
+				try {
+					const c = json(cachedRaw);
+					if (c && c.at != null && (time() - int(c.at)) < TTL && c.data)
+						return { ok: true, results: c.data, cached: true };
+				} catch (e) { /* 缓存损坏，忽略 */ }
+			}
+
+			/* 两路并行，各自写独立文件（避免并发输出交错） */
+			const script =
+				`rm -f /tmp/sb-ip1 /tmp/sb-ip2; ` +
+				`{ wget -qO- -T 4 'http://ip.3322.net' 2>/dev/null | head -c 40 > /tmp/sb-ip1; } & ` +
+				`{ wget -qO- -T 4 'http://myip.ipip.net' 2>/dev/null | head -c 160 > /tmp/sb-ip2; } & ` +
+				`wait`;
+
+			popen(script, 'r')?.read('all');
+
+			let results = [];
+
+			const d1 = trim(readfile('/tmp/sb-ip1') ?? '');
+			unlink('/tmp/sb-ip1');
+			if (length(d1) && match(d1, /^[0-9.]+$/))
+				push(results, { kind: 'local', src: '3322', ip: d1, loc: '运营商出口' });
+
+			const d2 = trim(readfile('/tmp/sb-ip2') ?? '');
+			unlink('/tmp/sb-ip2');
+			if (length(d2)) {
+				const m = match(d2, /[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/);
+				if (m) {
+					const locm = match(d2, /来自于：(.*)/);
+					push(results, {
+						kind: 'local', src: 'IPIP',
+						ip: m[0],
+						loc: locm ? trim(locm[1]) : '运营商出口'
+					});
+				}
+			}
+
+			/* 只在拿到结果时写缓存（避免把失败结果缓存 60 秒） */
+			if (length(results))
+				writefile(CACHE, sprintf('%J', { at: time(), data: results }));
+
+			return { ok: true, results };
+		}
+	},
+
+	/* ── 访问检查（国内/国外站点延迟） ── */
+	access_check: {
+		args: {},
+		call: function() {
+			/*
+			 * 用 Clash API 的 delay 接口做连通性检测：
+			 * sing-box 内部处理超时，不会阻塞 rpcd。
+			 * 分组映射：国内站用 🎯 全球直连，国外站用 🔰 节点选择。
+			 */
+			const probes = [
+				[ '百度搜索',   'DIRECT',                                     'http://www.baidu.com' ],
+				[ '网易云音乐', 'DIRECT',                                     'http://music.163.com' ],
+				[ 'GitHub',    '🔰 节点选择',                                  'http://github.com' ],
+				[ 'YouTube',   '🔰 节点选择',                                  'http://www.youtube.com' ],
+				[ 'Google',    '🔰 节点选择',                                  'http://www.google.com' ],
+				[ 'Cloudflare','🔰 节点选择',                                  'http://cp.cloudflare.com/generate_204' ]
+			];
+
+			/*
+			 * ★ 并行探测 + 总预算控制
+			 *
+			 * 原实现串行跑 6 个探针，每个 wget -T 10：
+			 *   正常 6×3s ≈ 20s（已贴 30s 超时线）
+			 *   任一组不存在/Clash 卡住 → 6×10s = 60s → rpcd 30s 硬超时被杀，
+			 *   还会带死同一时刻的其他 RPC。
+			 *
+			 * 改为：一条 shell 后台并发跑全部探针，最坏 5s 拿齐结果。
+			 */
+			const TMO = 2500;   /* 每个探针的 Clash 内部超时 */
+			const WGET_T = 4;   /* wget 自身超时（要 > TMO） */
+
+			/* 每个探针独立写自己的临时文件，避免并发 printf 输出交错。
+			 * 实测并发 printf 会把 "0\t" 和 "1\t" 混在一起导致解析全错。 */
+			let script = '';
+			for (let i = 0; i < length(probes); i++) {
+				const p = probes[i];
+				const path = `/proxies/${urlencode(p[1])}/delay` +
+				             `?timeout=${TMO}&url=${urlencode(p[2])}`;
+				const url = `http://${clash_api_conf()?.host ?? CLASH_HOST}:` +
+				            `${clash_api_conf()?.port ?? CLASH_PORT}${path}`;
+				const sec = clash_secret() ?? '';
+				const hdr = sec ? `--header=${shellquote(`Authorization: Bearer ${sec}`)}` : '';
+				const outFile = `/tmp/sb-probe-${i}.json`;
+
+				script += `rm -f ${shellquote(outFile)}; ` +
+				          `{ wget -qO- -T ${WGET_T} ${hdr} ${shellquote(url)} 2>/dev/null ` +
+				          `| head -c 256 > ${shellquote(outFile)}; } &\n`;
+			}
+			script += 'wait';
+
+			/* 注意：ucode 的 popen() 第三参数不是超时（实测被忽略），
+			 * 总时长靠每个 wget 的 -T 兜底。WGET_T=4 且全部并发 → 最坏约 4-5s。 */
+			popen(script, 'r')?.read('all');
+
+			/* 逐个读取各自的结果文件 */
+			let got = {};
+			for (let i = 0; i < length(probes); i++) {
+				const body = trim(readfile(`/tmp/sb-probe-${i}.json`) ?? '');
+				unlink(`/tmp/sb-probe-${i}.json`);
+				if (!length(body)) { got[i] = null; continue; }
+				let d = null;
+				try { d = json(body); } catch (e) { d = null; }
+				got[i] = (d && d.delay) ? int(d.delay) : null;
+			}
+
+			let results = [];
+			for (let i = 0; i < length(probes); i++) {
+				const p = probes[i];
+				const ms = got[i];
+				if (ms != null && ms > 0)
+					push(results, { name: p[0], ok: true, ms: ms });
+				else
+					push(results, { name: p[0], ok: false, ms: null });
+			}
+
+			return { ok: true, results };
+		}
+	},
+
+	/* ── DNS 缓存清理 ── */
+	flush_dns: {
+		args: {},
+		call: function() {
+			popen("/etc/init.d/dnsmasq restart >/dev/null 2>&1", 'r')?.read('all');
+			popen("rm -f /tmp/sing-box-cache.db 2>/dev/null", 'r')?.read('all');
+			return { ok: true };
+		}
+	},
+
+	/* ── 关闭全部连接 ── */
+	close_connections: {
+		args: {},
+		call: function() {
+			return clash_request('DELETE', '/connections');
+		}
+	},
+
+	
+
+/* 合并「出站目标相同」的规则：把多个 rule_set / 同类型条件聚合成一条
+ * 安全性：只在同出站内合并（同目标的先后顺序无影响），
+ *        合并后的位置取该组**首次出现**的位置，保证跨组优先级不变。
+ */
+
+	/* ── 清理插件临时文件 + 统计占用 ── */
+	tmp_cleanup: {
+		args: { scope: 'string' },
+		call: function(req) {
+			const scope = req.args?.scope ?? 'all';
+			const n1 = cleanup_tmp(scope);
+			const n2 = cleanup_stale_counts();
+			return { ok: true, removed: n1 + n2, tmp_removed: n1, stale_removed: n2, scope };
+		}
+	},
+
+	/* ── 临时文件占用统计（供前端展示与告警） ── */
+	tmp_stats: {
+		args: {},
+		call: function() {
+			const du = (pat) => {
+				const out = trim(popen(`du -sk ${pat} 2>/dev/null | awk '{s+=$1} END {print s+0}'`, 'r')?.read('all') ?? '');
+				return int(out) || 0;
+			};
+
+			const cnt = (pat) => {
+				const out = trim(popen(`ls -1 ${pat} 2>/dev/null | wc -l`, 'r')?.read('all') ?? '');
+				return int(out) || 0;
+			};
+
+			const decompile = du('/tmp/sb-rs-*.json');
+			const counts    = du('/tmp/sb-rs-count-*');
+			const saves     = du('/tmp/sb-rs-save-*');
+			const probes    = du('/tmp/sb-probe-*');
+			const ipcache   = du('/tmp/sb-ipcache.json');
+
+			/* tmpfs 总量与可用量（用 awk 直接取，避免 split 产生空串干扰） */
+			let tmpTotal = 0, tmpUsed = 0, tmpAvail = 0;
+			const dfOut = trim(popen(
+				`df -k /tmp 2>/dev/null | awk 'NR==2 {print $2" "$3" "$4}'`,
+				'r')?.read('all') ?? '');
+
+			const parts = split(dfOut, ' ');
+			if (length(parts) >= 3) {
+				tmpTotal = int(parts[0]) * 1024;
+				tmpUsed  = int(parts[1]) * 1024;
+				tmpAvail = int(parts[2]) * 1024;
+			}
+
+			return {
+				ok: true,
+				plugin: {
+					/* du -sk 返回 KB，这里统一转成字节 */
+					decompile_bytes: decompile * 1024,
+					counts_bytes:    counts * 1024,
+					saves_bytes:     saves * 1024,
+					probes_bytes:    probes * 1024,
+					ipcache_bytes:   ipcache * 1024,
+					total_bytes:     (decompile + counts + saves + probes + ipcache) * 1024,
+					decompile_files: cnt('/tmp/sb-rs-*.json'),
+					count_files:     cnt('/tmp/sb-rs-count-*')
+				},
+				tmpfs: {
+					/* 字段是**字节**（前面已 x1024），命名用 _bytes 避免前端重复换算 */
+					total_bytes: tmpTotal,
+					used_bytes:  tmpUsed,
+					avail_bytes: tmpAvail,
+					used_pct: tmpTotal > 0 ? int(tmpUsed * 100 / tmpTotal) : 0
+				}
+			};
+		}
+	},
+
+	/* ── 配置备份列表 ── */
+	backup_list: {
+		args: {},
+		call: function() {
+			const out = popen(`ls -la /etc/sing-box/config.json.bak* 2>/dev/null`, 'r')?.read('all') ?? '';
+			return { ok: true, content: out };
+		}
+	}
+};
+
+return { 'luci.singbox': methods };
