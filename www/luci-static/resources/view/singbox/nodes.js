@@ -3,7 +3,7 @@
 'require poll';
 'require ui';
 'require dom';
-'require singbox.common as sb';
+'require singbox.sbcommon as sb';
 
 /*
  * sing-box 节点管理页

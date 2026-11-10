@@ -1,7 +1,7 @@
 'use strict';
 'require view';
 'require dom';
-'require singbox.common as sb';
+'require singbox.sbcommon as sb';
 
 /*
  * Zashboard 内嵌页

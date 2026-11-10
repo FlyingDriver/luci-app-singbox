@@ -836,6 +836,111 @@ function clash_cache_invalidate(path) {
 }
 
 
+/*
+ * ─────────────────────────────────────────────────────────────────────────────
+ * 真正的「全局覆盖」（等价于 Clash 的 mode: global / direct）
+ *
+ * 【为什么不用 Clash 的 mode】
+ *   sing-box 的 Clash API 里 mode-list 只有 ["rule"]，PATCH /configs {"mode":"global"}
+ *   虽然返回 204，但读回 mode 仍是 "rule"（朝内核直接丢弃该字段）。
+ *   因此配置里的 {"clash_mode": "global"} 规则永远不可能被命中 —— 实测确认。
+ *
+ * 【本方案原理】
+ *   route.rules 是**有序**列表，首条匹配即生效。
+ *   在最前面插入一条「无条件规则」{"outbound": "<目标组>"}，
+ *   所有流量都会被它捕获，后续 13 条分流规则永不执行 = 真·全局覆盖。
+ *
+ * 【为什么不能插到 rules[0]】
+ *   现有 rules[0] 是 {"protocol":"dns","action":"hijack-dns"}，
+ *   用于劫持 DNS 查询到 sing-box 内置 DNS。它必须保持在最前，
+ *   否则 DNS 劫持失效 → fake-ip 失效 → 整个透明代理崩溃。
+ *   所以全捕获规则插在 hijack-dns **之后**。
+ *
+ * 【代价】
+ *   修改配置必须重启 sing-box（约 1-2 秒断流），无法热加载。
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+
+const GLOBAL_MARK = '__global_override__';
+
+/* 判断某条规则是否是本功能插入的全捕获规则 */
+function is_global_override(rule) {
+	/* 用自定义字段打标记；sing-box 会忽略未知字段，但为安全起见
+	 * 撤销时也会同时按「无条件 + outbound 匹配」双条件识别。 */
+	if (rule == null)
+		return false;
+	if (rule[GLOBAL_MARK] != null)
+		return true;
+	/* 兜底识别：无任何匹配条件、只有 outbound */
+	const cond = ['protocol','domain','domain_suffix','domain_keyword','domain_regex',
+	              'rule_set','ip_cidr','ip_is_private','port','port_range',
+	              'source_ip_cidr','process_name','inbound','clash_mode','network'];
+	for (let k in cond)
+		if (rule[k] != null) return false;
+	return rule.outbound != null || rule.action != null;
+}
+
+/* 读取当前全局覆盖状态：返回 'rule' / 'global' / 'direct' / 'custom' */
+function detect_global_mode(cfg) {
+	const rules = cfg?.route?.rules ?? [];
+	for (let r in rules) {
+		if (is_global_override(r)) {
+			const ob = r.outbound ?? '';
+			if (ob === '🔰 节点选择' || ob === 'proxy')
+				return { mode: 'global', outbound: ob };
+			if (ob === '🎯 全球直连' || ob === 'DIRECT' || ob === 'direct')
+				return { mode: 'direct', outbound: ob };
+			if (r.action === 'reject')
+				return { mode: 'block', outbound: '(reject)' };
+			return { mode: 'custom', outbound: ob };
+		}
+	}
+	return { mode: 'rule', outbound: null };
+}
+
+/* 移除所有全捕获规则 */
+function strip_global_override(cfg) {
+	const rules = cfg?.route?.rules ?? [];
+	cfg.route.rules = filter(rules, (r) => !is_global_override(r));
+}
+
+/* 设置全局覆盖：mode = 'rule' | 'global' | 'direct' */
+function apply_global_mode(cfg, mode, manual_outbound) {
+	strip_global_override(cfg);
+
+	if (mode === 'rule')
+		return { ok: true };
+
+	let target = manual_outbound;
+	if (mode === 'global') target = target ?? '🔰 节点选择';
+	else if (mode === 'direct') target = target ?? '🎯 全球直连';
+	else if (!target) return { ok: false, error: '未知模式' };
+
+	/* 校验目标出站存在 */
+	const ob = cfg.outbounds ?? [];
+	let found = false;
+	for (let o in ob)
+		if (o.tag === target || o.tag === 'DIRECT' && target === 'DIRECT') found = true;
+	if (!found)
+		return { ok: false, error: `出站 ${target} 不存在` };
+
+	/* 找到 hijack-dns 的位置，插到它之后 */
+	let pos = 0;
+	const rules = cfg.route.rules ?? [];
+	for (let i = 0; i < length(rules); i++) {
+		if (rules[i].action === 'hijack-dns') { pos = i + 1; break; }
+	}
+
+	const rule = { outbound: target };
+	push(rules, null);                       /* 占位扩容 */
+	for (let i = length(rules) - 1; i > pos; i--)
+		rules[i] = rules[i - 1];         /* 后移 */
+	rules[pos] = rule;
+
+	cfg.route.rules = rules;
+	return { ok: true };
+}
+
 const methods = {
 
 	/* ── 总览：服务 + 版本 + 模式 + 节点数 ── */
@@ -881,6 +986,72 @@ const methods = {
 				return clash_request('GET', p);
 
 			return clash_get_cached(p);
+		}
+	},
+
+	/* ── 读取全局覆盖状态 ── */
+	global_mode_get: {
+		args: {},
+		call: function() {
+			const cfg = read_config();
+			if (!cfg)
+				return { ok: false, error: '无法读取配置' };
+			const st = detect_global_mode(cfg);
+			return {
+				ok: true,
+				mode: st.mode,
+				outbound: st.outbound,
+				/* 供前端展示可选目标 */
+				choices: {
+					global: '🔰 节点选择',
+					direct: '🎯 全球直连',
+					rule:   '规则分流'
+				}
+			};
+		}
+	},
+
+	/* ── 设置全局覆盖（真·Clash 式 mode 切换） ──
+	 *   mode = 'rule'   移除全捕获规则，恢复 13 条分流规则
+	 *        = 'global' 所有流量 → 🔰 节点选择
+	 *        = 'direct' 所有流量 → 🎯 全球直连
+	 *        = 'custom' 所有流量 → 指定的出站 tag
+	 *   需要重启 sing-box 生效（约 1-2 秒断流）。
+	 */
+	global_mode_set: {
+		args: { mode: 'string', outbound: 'string' },
+		call: function(req) {
+			const mode = req.args?.mode;
+			const ob   = req.args?.outbound;
+			if (index(['rule', 'global', 'direct', 'custom'], mode) === -1)
+				return { ok: false, error: '非法模式' };
+			if (mode === 'custom' && (!ob || length(ob) == 0))
+				return { ok: false, error: 'custom 模式需要指定 outbound' };
+
+			return with_lock(function() {
+				const cfg = read_config();
+				if (!cfg)
+					return { ok: false, error: '无法读取配置' };
+
+				const r = apply_global_mode(cfg, mode, ob);
+				if (!r.ok)
+					return r;
+
+				const w = apply_config(cfg);
+				if (!w.ok)
+					return w;
+
+				/* 配置已落盘，异步重启（8 秒太久，让前端轮询） */
+				const rl = reload_service_async();
+				return {
+					ok: true,
+					mode: mode,
+					outbound: mode === 'rule' ? null
+					        : (mode === 'global' ? '🔰 节点选择'
+					        : (mode === 'direct' ? '🎯 全球直连' : ob)),
+					restarted: rl.ok
+				};
+			});
 		}
 	},
 

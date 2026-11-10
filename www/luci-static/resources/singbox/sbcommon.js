@@ -18,6 +18,8 @@
 const callStatus      = rpc.declare({ object: 'luci.singbox', method: 'status' });
 const callClashGet    = rpc.declare({ object: 'luci.singbox', method: 'clash_get', params: [ 'path' ] });
 const callSetMode     = rpc.declare({ object: 'luci.singbox', method: 'set_mode', params: [ 'mode' ] });
+const callGlobalModeGet = rpc.declare({ object: 'luci.singbox', method: 'global_mode_get' });
+const callGlobalModeSet = rpc.declare({ object: 'luci.singbox', method: 'global_mode_set', params: [ 'mode', 'outbound' ] });
 const callSelectNode  = rpc.declare({ object: 'luci.singbox', method: 'select_node', params: [ 'group', 'name' ] });
 const callTestNode    = rpc.declare({ object: 'luci.singbox', method: 'test_node', params: [ 'name' ] });
 const callNodesList   = rpc.declare({ object: 'luci.singbox', method: 'nodes_list' });
@@ -261,6 +263,7 @@ function toast(message, level) {
 return baseclass.extend({
 	/* RPC */
 	callStatus, callClashGet, callSetMode, callSelectNode, callTestNode,
+	callGlobalModeGet, callGlobalModeSet,
 	callNodesList, callNodeSave, callNodeDelete,
 	callRulesList, callRulesSave, callRulesMerge, callRulesetList, callRulesetRead, callRulesetSave, callService, callLogsRead,
 	callRunStats, callIpInfo, callAccessCheck, callFlushDns, callCloseConns, callTmpStats, callTmpCleanup,

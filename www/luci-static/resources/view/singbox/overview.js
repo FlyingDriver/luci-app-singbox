@@ -3,7 +3,7 @@
 'require poll';
 'require dom';
 'require ui';
-'require singbox.common as sb';
+'require singbox.sbcommon as sb';
 
 /*
  * sing-box 总览页
@@ -26,7 +26,8 @@ return view.extend({
 	load: function() {
 		return Promise.all([
 			sb.callStatus().catch(() => null),
-			sb.callClashGet('/proxies').catch(() => null)
+			sb.callClashGet('/proxies').catch(() => null),
+			sb.callGlobalModeGet().catch(() => null)
 		]);
 	},
 
@@ -36,6 +37,8 @@ return view.extend({
 
 		const status  = data[0] || {};
 		const proxies = (data[1] && data[1].ok && data[1].data) ? data[1].data.proxies : {};
+		/* 真正的全局覆盖状态（读 route.rules 里是否插了全捕获规则） */
+		const gmode   = (data[2] && data[2].ok) ? data[2] : { mode: 'rule', outbound: null };
 
 		const elStatusBadge = E('span');
 		const elRunData     = E('div', { class: 'oc-rundata' });
@@ -127,9 +130,24 @@ return view.extend({
 			E('span', { class: 'oc-switch-label' }, [ status.running ? _('已启用') : _('已禁用') ])
 		]);
 
-		/* ── 运行模式（等效实现：改变漏网之鱼指向） ── */
-		/* ★ 组名集中在这里，方便用户改了自己的组名后统一调整。
-		 *   旧实现把组名字符串散落在 5 处，改一个组名就会让模式显示静默错乱。 */
+		/* ══════════════════════════════════════════════════════════════════
+		 * 运行模式（真·全局覆盖，等价于 Clash 的 mode: rule / global / direct）
+		 *
+		 * 【为什么不是 Clash 的 mode】
+		 *   sing-box 的 Clash API 里 mode-list 只有 ["rule"]，
+		 *   PATCH /configs {"mode":"global"} 返回 204 但读回仍是 rule
+		 *   （内核直接丢弃）→ 配置里的 clash_mode 规则永远不会命中。
+		 *
+		 * 【本实现】
+		 *   往 route.rules 最前面（hijack-dns 之后）插入一条无条件的
+		 *   {"outbound":"<目标组>"}，所有流量都被它捕获，后面的 13 条
+		 *   分流规则不再执行 = 真正的全局覆盖。
+		 *   切回「规则」时把这条规则移除，完全还原。
+		 *
+		 * 【代价】
+		 *   保存配置 + 重启 sing-box，约 1-2 秒断流。
+		 * ══════════════════════════════════════════════════════════════════ */
+
 		const G = {
 			fallback: '🐟 漏网之鱼',
 			direct:   '🎯 全球直连',
@@ -140,92 +158,100 @@ return view.extend({
 		const fbGroup = proxies[G.fallback];
 		const currentTarget = (fbGroup && fbGroup.now) || '';
 
-		/*
-		 * 把「兜底出站」映射到分段控件的选项值。
-		 *
-		 * ★ 不要用「反向猜测」（=== G.direct ? 'direct' : ...）：
-		 *   一旦用户改了组名，或者兜底出站指向了别的组（例如手动选了
-		 *   Ⓜ️ 微软服务），反推就会落到 else 分支显示"规则"，与真实状态不符。
-		 *
-		 * 这里改成「正向映射」：把三个已知目标对应的值建表，
-		 * 不在表里的值如实显示为「其他」。这样永远不会误报。
-		 */
-		const TARGET_TO_SEG = {};
-		TARGET_TO_SEG[G.direct] = 'direct';
-		TARGET_TO_SEG[G.proxy]  = 'global';
-		TARGET_TO_SEG[G.auto]   = 'rule';
-		const modeGuess = TARGET_TO_SEG[currentTarget] ?? '';
+		const MODE_LABEL = {
+			rule:   _('规则分流'),
+			global: _('全局代理'),
+			direct: _('全部直连')
+		};
 
-		/* 渲染「当前出站」，切换成功后会重新调用，保证显示的是真实值 */
-		const renderProxySeg = function(target) {
-			const segVal = TARGET_TO_SEG[target] ?? '';
-			const label = { direct: _('全部直连'), global: _('全局代理'), rule: _('规则分流') }[segVal]
-			           || _('自定义出站');
+		/* 渲染当前模式说明 */
+		const renderModeInfo = function(mode, outbound) {
+			const isOverride = (mode === 'global' || mode === 'direct' || mode === 'custom');
+			const desc = isOverride
+				? _('所有流量强制走「%s」，分流规则暂不生效').format(outbound || MODE_LABEL[mode])
+				: _('按 13 条分流规则处理；未匹配的流量走兜底（%s）').format(currentTarget || G.fallback);
 
 			dom.content(elProxySeg, [
 				E('div', { class: 'oc-inline' }, [
-					E('span', { class: 'oc-muted' }, [ G.fallback + ' →' ]),
-					E('strong', {}, [ target || '—' ]),
-					(segVal ? '' : ' '),
-					(segVal ? '' : E('span', { class: 'sb-hint' }, [ _('（非预设模式）') ]))
+					E('span', { class: 'oc-muted' }, [ isOverride ? _('全局覆盖 →') : _('兜底出站 →') ]),
+					E('strong', {}, [ isOverride ? (outbound || '—') : (currentTarget || '—') ])
 				]),
-				E('div', { class: 'sb-hint', style: 'margin-top: 6px;' }, [
-					_('模式切换改变兜底出站；已命中规则的流量不受影响。')
-				])
+				E('div', { class: 'sb-hint', style: 'margin-top: 6px;' }, [ desc ]),
+				isOverride
+					? E('div', { class: 'sb-hint', style: 'margin-top: 4px; color: var(--warn, #e8a33d);' },
+						[ _('⚠ 切换模式会重启 sing-box，约 1-2 秒中断') ])
+					: ''
 			]);
-			return label;
+		};
+
+		/* 重启后轮询等待服务回来 */
+		const waitServiceBack = function(cb) {
+			let n = 0;
+			const tick = function() {
+				n++;
+				if (n > 30) { cb(false); return; }
+				sb.callStatus().then(function(st) {
+					if (st && st.running) cb(true);
+					else window.setTimeout(tick, 1000);
+				}).catch(function() { window.setTimeout(tick, 1000); });
+			};
+			window.setTimeout(tick, 1500);
 		};
 
 		dom.content(elModeSeg, [ sb.segmented([
 			{ value: 'rule',   label: _('规则') },
 			{ value: 'global', label: _('全局') },
 			{ value: 'direct', label: _('直连') }
-		], modeGuess, function(v) {
-			const target = v === 'global' ? G.proxy
-			             : (v === 'direct' ? G.direct : G.auto);
+		], gmode.mode === 'custom' ? '' : gmode.mode, function(v) {
+			if (v === gmode.mode) return;
 
-			sb.callSelectNode(G.fallback, target).then(function(r) {
-				if (r && r.ok) {
-					/*
-					 * ★ 不要假设"RPC 返回 ok 就是切换成功了"。
-					 * 必须回读一次真实状态：后端 TTL 缓存曾经有过单位 bug
-					 * （time() 是秒但 TTL 当毫秒用），导致"看起来切换了、
-					 * 刷新又变回去"这种极难排查的现象。
-					 * 现在后端已修，但前端仍以「回读值」为准，不信任 RPC 返回值。
-					 */
-					return sb.callClashGet('/proxies').then(function(res) {
-						const real = res && res.ok && res.data
-						           && res.data.proxies
-						           && res.data.proxies[G.fallback]
-						           && res.data.proxies[G.fallback].now;
-						const actual = real || target;
-						const lbl = renderProxySeg(actual);
+			const btn = elModeSeg.querySelector('.sb-seg');
+			if (btn) btn.classList.add('is-busy');
+			sb.toast(_('正在切换到「%s」…').format(MODE_LABEL[v]), 'info');
 
-						if (real && real !== target) {
-							/* 回读值与目标不符：如实告知，并把控件拉回真实状态 */
-							sb.toast(_('切换未生效，当前仍为「%s」').format(lbl), 'err');
-							const el = elModeSeg.querySelector('.sb-seg');
-							if (el) {
-								const want = TARGET_TO_SEG[real] ?? '';
-								el.querySelectorAll('.sb-seg-item').forEach(function(b, i) {
-									const vals = ['rule', 'global', 'direct'];
-									const on = (vals[i] === want);
-									b.classList.toggle('is-active', on);
-									b.setAttribute('aria-pressed', on ? 'true' : 'false');
-								});
-							}
-						} else {
-							sb.toast(_('已切换为「%s」').format(lbl), 'ok');
-						}
-					});
+			sb.callGlobalModeSet(v).then(function(r) {
+				if (!r || !r.ok) {
+					sb.toast((r && r.error) || _('切换失败'), 'err');
+					/* 失败：把高亮拉回真实状态 */
+					const cur = (gmode.mode === 'custom') ? '' : gmode.mode;
+					const el = elModeSeg.querySelector('.sb-seg');
+					if (el) {
+						const vals = ['rule', 'global', 'direct'];
+						el.querySelectorAll('.sb-seg-item').forEach(function(b, i) {
+							const on = (vals[i] === cur);
+							b.classList.toggle('is-active', on);
+							b.setAttribute('aria-pressed', on ? 'true' : 'false');
+						});
+					}
+					if (btn) btn.classList.remove('is-busy');
+					return;
 				}
-				sb.toast((r && r.error) || _('切换失败'), 'err');
+
+				/* 成功：等 sing-box 重启回来，然后重新拉真实状态 */
+				sb.toast(_('已切换为「%s」，等待服务重启…').format(MODE_LABEL[v]), 'ok');
+				waitServiceBack(function(ready) {
+					if (btn) btn.classList.remove('is-busy');
+					if (!ready) {
+						sb.toast(_('服务重启超时，请手动检查'), 'err');
+						return;
+					}
+					sb.callGlobalModeGet().then(function(g) {
+						if (g && g.ok) {
+							gmode.mode = g.mode;
+							gmode.outbound = g.outbound;
+							renderModeInfo(g.mode, g.outbound);
+						}
+						sb.toast(_('已切换为「%s」').format(MODE_LABEL[v]), 'ok');
+					}).catch(function() {});
+				});
 			}).catch(function(e) {
+				if (btn) btn.classList.remove('is-busy');
 				sb.toast(String(e), 'err');
 			});
 		}) ]);
 
-		renderProxySeg(currentTarget);
+		dom.content(elProxySeg, [ E('div', { class: 'sb-hint' }, [ _('读取中…') ]) ]);
+		renderModeInfo(gmode.mode, gmode.outbound);
 
 		/* ── 快捷操作（去掉与上方重复的"重启服务"） ── */
 		const quickActions = [

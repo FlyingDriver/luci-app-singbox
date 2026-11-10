@@ -16,7 +16,7 @@
 set -e
 
 PKG_NAME="luci-app-singbox"
-PKG_VERSION="1.0.2"
+PKG_VERSION="1.1.0"
 PKG_RELEASE="1"
 PKG_ARCH="all"
 
@@ -75,7 +75,7 @@ cp "$ROOT/usr/share/luci/menu.d/luci-app-singbox.json" "$DATA/usr/share/luci/men
 mkdir -p "$DATA/www/luci-static/resources/singbox"
 mkdir -p "$DATA/www/luci-static/resources/view/singbox"
 cp "$ROOT/www/luci-static/resources/singbox.css" "$DATA/www/luci-static/resources/"
-cp "$ROOT/www/luci-static/resources/singbox/common.js" "$DATA/www/luci-static/resources/singbox/"
+cp "$ROOT/www/luci-static/resources/singbox/sbcommon.js" "$DATA/www/luci-static/resources/singbox/"
 cp "$ROOT/www/luci-static/resources/view/singbox/"*.js "$DATA/www/luci-static/resources/view/singbox/"
 
 # 可选：安装/集成脚本（放 /usr/share/luci-app-singbox/ 供手动调用）
@@ -92,7 +92,7 @@ chmod 755 "$DATA/usr/share/luci-app-singbox/setup-zashboard.sh"
 chmod 644 "$DATA/usr/share/rpcd/acl.d/luci-app-singbox.json"
 chmod 644 "$DATA/usr/share/luci/menu.d/luci-app-singbox.json"
 chmod 644 "$DATA/www/luci-static/resources/singbox.css"
-chmod 644 "$DATA/www/luci-static/resources/singbox/common.js"
+chmod 644 "$DATA/www/luci-static/resources/singbox/sbcommon.js"
 chmod 644 "$DATA/www/luci-static/resources/view/singbox/"*.js
 chmod 644 "$DATA/usr/share/luci-app-singbox/README.md"
 

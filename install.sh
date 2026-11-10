@@ -135,7 +135,7 @@ cp -f "$PKG_DIR/usr/share/luci/menu.d/luci-app-singbox.json" "$MENU_DST"
 
 # 前端
 cp -f "$PKG_DIR/www/luci-static/resources/singbox.css"       "$CSS_DST"
-cp -f "$PKG_DIR/www/luci-static/resources/singbox/common.js" "$JS_DIR/common.js"
+cp -f "$PKG_DIR/www/luci-static/resources/singbox/sbcommon.js" "$JS_DIR/sbcommon.js"
 cp -f "$PKG_DIR/www/luci-static/resources/view/singbox/"*.js "$VIEW_DST/"
 
 # 附带工具与文档
@@ -145,7 +145,7 @@ cp -f "$PKG_DIR/README.md"          "$DOC_DIR/" 2>/dev/null || true
 # 权限
 chmod 755 "$UCODE_DST"
 chmod 644 "$ACL_DST" "$MENU_DST" "$CSS_DST"
-chmod 644 "$JS_DIR/common.js" "$VIEW_DST"/*.js
+chmod 644 "$JS_DIR/sbcommon.js" "$VIEW_DST"/*.js
 
 # 后端语法校验（失败即中止，避免装出一个"看起来能开但 RPC 全错"的插件）
 if ! ucode -c "$UCODE_DST" >/dev/null 2>&1; then
