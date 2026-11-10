@@ -14,15 +14,15 @@
 
 ```sh
 # 本地打包
-tar czf luci-app-singbox-1.0.1.tar.gz \
+tar czf luci-app-singbox-1.0.2.tar.gz \
   --exclude='./dist' --exclude='./.build*' \
   -C luci-app-singbox .
 
 # 上传到路由器并安装
-scp luci-app-singbox-1.0.1.tar.gz root@192.168.1.1:/tmp/
+scp luci-app-singbox-1.0.2.tar.gz root@192.168.1.1:/tmp/
 ssh root@192.168.1.1 '
-  cd /tmp && tar xzf luci-app-singbox-1.0.1.tar.gz -C luci-app-singbox --one-top-level 2>/dev/null ||
-  (mkdir -p luci-app-singbox && tar xzf luci-app-singbox-1.0.1.tar.gz -C luci-app-singbox)
+  cd /tmp && tar xzf luci-app-singbox-1.0.2.tar.gz -C luci-app-singbox --one-top-level 2>/dev/null ||
+  (mkdir -p luci-app-singbox && tar xzf luci-app-singbox-1.0.2.tar.gz -C luci-app-singbox)
   cd luci-app-singbox && sh install.sh
 '
 ```
@@ -35,10 +35,10 @@ ssh root@192.168.1.1 '
 
 ```sh
 sh packaging/build-ipk.sh
-# 产物：dist/luci-app-singbox_1.0.1-1_all.ipk
+# 产物：dist/luci-app-singbox_1.0.2-1_all.ipk
 
 scp dist/*.ipk root@192.168.1.1:/tmp/
-ssh root@192.168.1.1 'opkg install /tmp/luci-app-singbox_1.0.1-1_all.ipk'
+ssh root@192.168.1.1 'opkg install /tmp/luci-app-singbox_1.0.2-1_all.ipk'
 ```
 
 依赖：`ar` 命令（`apt install binutils`）。
@@ -66,8 +66,8 @@ make package/luci-app-singbox/compile V=s
 
 # 4. 产物
 find bin/ -name 'luci-app-singbox*'
-# → bin/packages/<arch>/base/luci-app-singbox_1.0.1-1_all.ipk  (opkg)
-# → bin/packages/<arch>/base/luci-app-singbox-1.0.1-r1.apk     (apk)
+# → bin/packages/<arch>/base/luci-app-singbox_1.0.2-1_all.ipk  (opkg)
+# → bin/packages/<arch>/base/luci-app-singbox-1.0.2-r1.apk     (apk)
 ```
 
 **提交到 openwrt/luci 上游**：
@@ -82,7 +82,7 @@ find bin/ -name 'luci-app-singbox*'
 
 ## 版本号约定
 
-`PKG_VERSION-PKG_RELEASE`，例如 `1.0.1-1`：
+`PKG_VERSION-PKG_RELEASE`，例如 `1.0.2-1`：
 
 - `PKG_VERSION`：语义化版本，功能变更时递增
 - `PKG_RELEASE`：同一版本内的打包修订号

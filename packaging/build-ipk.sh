@@ -16,7 +16,7 @@
 set -e
 
 PKG_NAME="luci-app-singbox"
-PKG_VERSION="1.0.1"
+PKG_VERSION="1.0.2"
 PKG_RELEASE="1"
 PKG_ARCH="all"
 

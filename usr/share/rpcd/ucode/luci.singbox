@@ -787,10 +787,33 @@ function rules_merge(rules) {
  * 用 500ms 内存缓存合并同一轮询周期内的重复请求。
  * ───────────────────────────────────────────── */
 const _clash_cache = {};
-const CLASH_CACHE_TTL = 500;   /* ms */
+const CLASH_CACHE_TTL = 500;   /* 毫秒 */
+
+/*
+ * ★ 单位陷阱（真实 bug，2026-11-10 修复）
+ *
+ * 旧实现用 `time()` 取当前时间，但 ucode 的 time() 返回**秒**（整数），
+ * 而 TTL 常数写的是 500（本意毫秒）。于是判定变成：
+ *
+ *     (now_seconds - at_seconds) < 500
+ *
+ * 秒级差值永远是 0/1/2…，恒小于 500 →
+ * 缓存实际有效期变成 **500 秒（8 分 20 秒）**，而不是 500 毫秒。
+ *
+ * 后果：
+ *   切换节点 / 切换运行模式成功后，页面再读 /proxies 拿到的是
+ *   8 分钟前的旧数据 → 看起来「点了没反应，刷新又变回去了」。
+ *   而实际上后端切换是成功的（直连 Clash API 读可验证）。
+ *
+ * 修复：用 clock(true) 取毫秒级时间戳（返回 [秒, 纳秒]）。
+ */
+function now_ms() {
+	const c = clock(true);
+	return c[0] * 1000 + int(c[1] / 1000000);
+}
 
 function clash_get_cached(path) {
-	const now = time();
+	const now = now_ms();
 	const hit = _clash_cache[path];
 
 	if (hit && (now - hit.at) < CLASH_CACHE_TTL)
@@ -799,6 +822,17 @@ function clash_get_cached(path) {
 	const val = clash_request('GET', path);
 	_clash_cache[path] = { at: now, val: val };
 	return val;
+}
+
+/* 写操作后必须失效缓存，否则紧接着读会拿到切换前的旧值 */
+function clash_cache_invalidate(path) {
+	if (path == null) {
+		/* 全清 */
+		for (let k in _clash_cache)
+			delete _clash_cache[k];
+		return;
+	}
+	delete _clash_cache[path];
 }
 
 
@@ -857,7 +891,12 @@ const methods = {
 			const mode = req.args?.mode;
 			if (index(['rule', 'global', 'direct'], mode) === -1)
 				return { ok: false, error: '非法模式' };
-			return clash_request('PATCH', '/configs', { mode });
+			const r = clash_request('PATCH', '/configs', { mode });
+			if (r.ok) {
+				clash_cache_invalidate('/configs');
+				clash_cache_invalidate('/proxies');
+			}
+			return r;
 		}
 	},
 
@@ -869,7 +908,11 @@ const methods = {
 			const name = req.args?.name;
 			if (!group || !name)
 				return { ok: false, error: '参数缺失' };
-			return clash_request('PUT', `/proxies/${urlencode(group)}`, { name });
+			const r = clash_request('PUT', `/proxies/${urlencode(group)}`, { name });
+			/* 切换成功后立即失效 /proxies 缓存，否则前端刷新会读到旧状态 */
+			if (r.ok)
+				clash_cache_invalidate('/proxies');
+			return r;
 		}
 	},
 

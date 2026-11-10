@@ -2,6 +2,64 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [1.0.2] - 2026-11-10
+
+修复「切换运行模式 / 节点后，刷新页面状态又变回去」的严重 bug。
+
+### 修复
+
+- **`clash_get` 缓存时间单位错误（核心 bug）**
+
+  旧实现用 `time()` 取当前时间做 TTL 判定：
+
+  ```ucode
+  const CLASH_CACHE_TTL = 500;   /* 注释：毫秒 */
+  const now = time();            /* 但 time() 返回的是「秒」 */
+  if (hit && (now - hit.at) < CLASH_CACHE_TTL) return hit.val;
+  ```
+
+  秒级差值恒为 0/1/2…，永远小于 500，于是
+  **缓存实际有效期变成 500 秒（8 分 20 秒）而不是 500 毫秒**。
+
+  后果：切换节点或运行模式成功后，页面再读 `/proxies` 拿到的是
+  8 分钟前的旧数据 → 表现为「点了没反应、刷新又变回去」，
+  而实际上后端切换是成功的（直连 Clash API 可验证）。
+
+  修复：改用 `clock(true)` 取毫秒时间戳（返回 `[秒, 纳秒]`）。
+
+- **写操作后未失效缓存**
+
+  `select_node` / `set_mode` 成功后立即清除相关缓存键，
+  避免紧随其后的读取拿到切换前的旧值。
+
+- **概览页「运行模式」显示可能误报**
+
+  旧代码用反向猜测推断当前模式：
+
+  ```js
+  const modeGuess = currentTarget === G.direct ? 'direct'
+                  : (currentTarget === G.proxy ? 'global' : 'rule');
+  ```
+
+  兜底出站只要不是这两个已知值（例如手动选了 `Ⓜ️ 微软服务`），
+  就会被误显示为「规则」。改为正向映射表，未知值如实显示「自定义出站」。
+
+- **切换后不回读真实状态**
+
+  旧代码仅凭 `select_node` 返回 `ok: true` 就更新界面。
+  现在改为**切换后回读 `/proxies` 确认真实值**：
+  若回读值与目标不符，提示「切换未生效」并把控件拉回真实状态，
+  不再出现「界面显示成功但实际没切」的假象。
+
+### 已知限制（本次确认）
+
+- **`set_mode` RPC 在 sing-box 上不可用**：sing-box 的 Clash API
+  `mode-list` 只有 `["rule"]`，`PATCH /configs {"mode":"global"}` 返回
+  `400 Body invalid`。因此「运行模式」是通过切换兜底出站实现的等效方案，
+  而非真正修改 sing-box 的 mode。前端已不再依赖 `set_mode`。
+
+---
+
 ## [1.0.1] - 2026-11-02
 
 性能与稳定性修复。经 8 次真实重启验证。

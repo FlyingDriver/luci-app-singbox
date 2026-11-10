@@ -139,8 +139,42 @@ return view.extend({
 
 		const fbGroup = proxies[G.fallback];
 		const currentTarget = (fbGroup && fbGroup.now) || '';
-		const modeGuess = currentTarget === G.direct ? 'direct'
-		                : (currentTarget === G.proxy ? 'global' : 'rule');
+
+		/*
+		 * 把「兜底出站」映射到分段控件的选项值。
+		 *
+		 * ★ 不要用「反向猜测」（=== G.direct ? 'direct' : ...）：
+		 *   一旦用户改了组名，或者兜底出站指向了别的组（例如手动选了
+		 *   Ⓜ️ 微软服务），反推就会落到 else 分支显示"规则"，与真实状态不符。
+		 *
+		 * 这里改成「正向映射」：把三个已知目标对应的值建表，
+		 * 不在表里的值如实显示为「其他」。这样永远不会误报。
+		 */
+		const TARGET_TO_SEG = {};
+		TARGET_TO_SEG[G.direct] = 'direct';
+		TARGET_TO_SEG[G.proxy]  = 'global';
+		TARGET_TO_SEG[G.auto]   = 'rule';
+		const modeGuess = TARGET_TO_SEG[currentTarget] ?? '';
+
+		/* 渲染「当前出站」，切换成功后会重新调用，保证显示的是真实值 */
+		const renderProxySeg = function(target) {
+			const segVal = TARGET_TO_SEG[target] ?? '';
+			const label = { direct: _('全部直连'), global: _('全局代理'), rule: _('规则分流') }[segVal]
+			           || _('自定义出站');
+
+			dom.content(elProxySeg, [
+				E('div', { class: 'oc-inline' }, [
+					E('span', { class: 'oc-muted' }, [ G.fallback + ' →' ]),
+					E('strong', {}, [ target || '—' ]),
+					(segVal ? '' : ' '),
+					(segVal ? '' : E('span', { class: 'sb-hint' }, [ _('（非预设模式）') ]))
+				]),
+				E('div', { class: 'sb-hint', style: 'margin-top: 6px;' }, [
+					_('模式切换改变兜底出站；已命中规则的流量不受影响。')
+				])
+			]);
+			return label;
+		};
 
 		dom.content(elModeSeg, [ sb.segmented([
 			{ value: 'rule',   label: _('规则') },
@@ -149,32 +183,49 @@ return view.extend({
 		], modeGuess, function(v) {
 			const target = v === 'global' ? G.proxy
 			             : (v === 'direct' ? G.direct : G.auto);
-			const label  = v === 'global' ? _('全局代理') : (v === 'direct' ? _('全部直连') : _('规则分流'));
 
 			sb.callSelectNode(G.fallback, target).then(function(r) {
 				if (r && r.ok) {
-					sb.toast(_('已切换为「%s」').format(label), 'ok');
-					dom.content(elProxySeg, [
-						E('div', { class: 'oc-inline' }, [
-							E('span', { class: 'oc-muted' }, [ G.fallback + ' →' ]),
-							E('strong', {}, [ target ])
-						])
-					]);
-				} else {
-					sb.toast((r && r.error) || _('切换失败'), 'err');
+					/*
+					 * ★ 不要假设"RPC 返回 ok 就是切换成功了"。
+					 * 必须回读一次真实状态：后端 TTL 缓存曾经有过单位 bug
+					 * （time() 是秒但 TTL 当毫秒用），导致"看起来切换了、
+					 * 刷新又变回去"这种极难排查的现象。
+					 * 现在后端已修，但前端仍以「回读值」为准，不信任 RPC 返回值。
+					 */
+					return sb.callClashGet('/proxies').then(function(res) {
+						const real = res && res.ok && res.data
+						           && res.data.proxies
+						           && res.data.proxies[G.fallback]
+						           && res.data.proxies[G.fallback].now;
+						const actual = real || target;
+						const lbl = renderProxySeg(actual);
+
+						if (real && real !== target) {
+							/* 回读值与目标不符：如实告知，并把控件拉回真实状态 */
+							sb.toast(_('切换未生效，当前仍为「%s」').format(lbl), 'err');
+							const el = elModeSeg.querySelector('.sb-seg');
+							if (el) {
+								const want = TARGET_TO_SEG[real] ?? '';
+								el.querySelectorAll('.sb-seg-item').forEach(function(b, i) {
+									const vals = ['rule', 'global', 'direct'];
+									const on = (vals[i] === want);
+									b.classList.toggle('is-active', on);
+									b.setAttribute('aria-pressed', on ? 'true' : 'false');
+								});
+							}
+						} else {
+							sb.toast(_('已切换为「%s」').format(lbl), 'ok');
+						}
+					});
 				}
+				sb.toast((r && r.error) || _('切换失败'), 'err');
+			}).catch(function(e) {
+				sb.toast(String(e), 'err');
 			});
 		}) ]);
 
-		dom.content(elProxySeg, [
-			E('div', { class: 'oc-inline' }, [
-				E('span', { class: 'oc-muted' }, [ G.fallback + ' →' ]),
-				E('strong', {}, [ currentTarget || '—' ])
-			]),
-			E('div', { class: 'sb-hint', style: 'margin-top: 6px;' }, [
-				_('模式切换改变兜底出站；已命中规则的流量不受影响。')
-			])
-		]);
+		renderProxySeg(currentTarget);
 
 		/* ── 快捷操作（去掉与上方重复的"重启服务"） ── */
 		const quickActions = [
